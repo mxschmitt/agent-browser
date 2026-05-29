@@ -487,6 +487,48 @@ fn run_close_all(flags: &Flags) {
     }
 }
 
+/// Returns `true` if the relaunch succeeded and the elevated daemon should
+/// exit; `false` if the relaunch could not be performed and the elevated
+/// daemon should continue (and probably hit the original Chrome bug).
+#[cfg(windows)]
+fn relaunch_daemon_unelevated(session: &str) -> bool {
+    use std::time::Duration;
+
+    let exe = match env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to resolve current_exe for relaunch: {}", e);
+            return false;
+        }
+    };
+    let argv: Vec<String> = env::args().skip(1).collect();
+
+    if let Err(e) = native::deelevate::spawn_self_unelevated(&exe, &argv) {
+        eprintln!(
+            "Note: failed to relaunch daemon unelevated ({}); continuing elevated. \
+             Chrome may auto-de-elevate and produce 'exited early' errors.",
+            e
+        );
+        return false;
+    }
+
+    // Wait until the unelevated successor is reachable on its IPC socket.
+    // The CLI parent polls daemon_ready every 100ms with its own deadline;
+    // we stay alive long enough that the parent observes a smooth handoff
+    // rather than seeing the elevated daemon exit before anyone is bound.
+    let ready = native::deelevate::wait_until(
+        || connection::daemon_ready(session),
+        Duration::from_secs(30),
+    );
+
+    if !ready {
+        eprintln!("Daemon relaunched unelevated but did not become reachable in time");
+        return false;
+    }
+
+    true
+}
+
 fn main() {
     // Rust ignores SIGPIPE by default, causing println! to panic on broken pipes.
     // Reset to SIG_DFL so the OS terminates the process cleanly instead.
@@ -511,6 +553,21 @@ fn main() {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
         let session = env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string());
+
+        // Windows: when launched from a UAC-elevated shell, the daemon
+        // inherits `TokenElevationTypeFull`. Chrome (M138+) reacts to that
+        // by trying to relaunch itself unelevated through Explorer; the
+        // original Chrome process exits cleanly, surfacing as "Chrome
+        // exited early (exit code: 0)". Avoid the whole class of problem
+        // by relaunching the daemon itself unelevated, then exiting once
+        // the successor is reachable.
+        #[cfg(windows)]
+        if native::deelevate::is_unnecessarily_elevated()
+            && relaunch_daemon_unelevated(&session)
+        {
+            return;
+        }
+
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(native::daemon::run_daemon(&session));
         return;

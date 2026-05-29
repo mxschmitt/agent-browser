@@ -10,6 +10,8 @@ pub mod cdp;
 pub mod cookies;
 #[allow(dead_code)]
 pub mod daemon;
+#[cfg(windows)]
+pub mod deelevate;
 #[allow(dead_code)]
 pub mod diff;
 #[allow(dead_code)]
